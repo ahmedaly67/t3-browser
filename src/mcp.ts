@@ -14,6 +14,7 @@ import { BridgeClient, isDaemonRunning } from "./client.js";
 import type { SessionInfo, TabInfo } from "./protocol.js";
 import { MAX_INLINE_UPLOAD_BYTES } from "./remote.js";
 import { readThread } from "./t3thread.js";
+import { CodeRunner } from "./run-code.js";
 import { VERSION } from "./version.js";
 
 export const INSTRUCTIONS = `T3 Browser lets you use a web browser for the user.
@@ -387,6 +388,7 @@ export async function runMcp(): Promise<void> {
     { keepTabs: z.array(z.number()).optional(), closeTabs: z.boolean().optional() },
     async ({ keepTabs, closeTabs }) => {
       await isolated.close();
+      await runner.close();
       return json(await callUser("session.release", { keepTabIds: keepTabs ?? [], closeTabs }));
     },
   );
@@ -403,6 +405,27 @@ export async function runMcp(): Promise<void> {
         usage: `agent-browser --session t3-user connect "${bridge.reachable(status.cdpUrl)}" && agent-browser --session t3-user snapshot -i`,
         note: "The URL contains a local secret. Do not share it or paste it into web pages.",
       });
+    },
+  );
+
+  const runner = new CodeRunner(async () => {
+    const status = await callUser<{ cdpUrl: string }>("daemon.status");
+    return bridge.reachable(status.cdpUrl);
+  });
+
+  tool(
+    "browser_run_code",
+    "Run a Playwright script against this thread's tabs in the user's real, signed-in Chrome. Pass `filename` (a .js file) or `code`, containing one function: `async (page) => { ... }`. `page` is a Playwright Page in this thread's tab group, kept between calls; page.context().newPage() opens more tabs in the group. Supports goto, evaluate, waitForSelector, route/fulfill, addInitScript, request.get/post (with the user's cookies), screenshot. Returns the function's return value. Same contract as Playwright MCP's browser_run_code_unsafe; the script runs as trusted local code.",
+    {
+      filename: z.string().optional().describe("Absolute path of a .js file holding `async (page) => { ... }`"),
+      code: z.string().optional().describe("Inline `async (page) => { ... }` (use filename for anything long)"),
+      timeoutMs: z.number().optional().describe("Default 30 minutes, max 2 hours"),
+    },
+    async ({ filename, code, timeoutMs }) => {
+      holdsUserTabs = true;
+      const result = await runner.run({ filename, code, timeoutMs });
+      if (result === undefined) return json("(no return value)");
+      return json(typeof result === "string" ? result : JSON.stringify(result, null, 2));
     },
   );
 

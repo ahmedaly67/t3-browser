@@ -25,8 +25,16 @@ interface Route {
   childSessionId?: string;
 }
 
-const targetIdFor = (tabId: number) => `t3tab-${tabId}`;
+// Target ids. Clients such as Playwright assume a page's targetId equals its main frame id (true in
+// Chrome), so the relay reports Chrome's real id, read from Page.getFrameTree. The synthetic
+// `t3tab-<tabId>` form is only a fallback when the real id cannot be read.
+const fallbackTargetId = (tabId: number) => `t3tab-${tabId}`;
+const realTargetIds = new Map<number, string>();
+const tabsByTargetId = new Map<string, number>();
+const targetIdFor = (tabId: number) => realTargetIds.get(tabId) ?? fallbackTargetId(tabId);
 const tabIdFor = (targetId: string) => {
+  const known = tabsByTargetId.get(targetId);
+  if (known !== undefined) return known;
   const m = /^t3tab-(\d+)$/.exec(targetId);
   return m ? Number(m[1]) : undefined;
 };
@@ -92,7 +100,37 @@ export class CdpRelay {
   private async refreshTabs(): Promise<TabInfo[]> {
     const tabs = await this.ext<TabInfo[]>("tabs.list", { scope: "session" });
     this.knownTabs = new Map(tabs.map((t) => [t.tabId, t]));
+    await Promise.all(tabs.map((t) => this.resolveTargetId(t.tabId)));
     return tabs;
+  }
+
+  /** Some tab of this thread, attached, for browser-level calls that need a page (cookies). */
+  private async anyTab(): Promise<number | undefined> {
+    const attached = this.pageSession.keys().next();
+    if (!attached.done) return attached.value;
+    const [first] = await this.refreshTabs();
+    if (!first) return undefined;
+    await this.ext("cdp.attach", { tabId: first.tabId });
+    return first.tabId;
+  }
+
+  /** Learn Chrome's real targetId for a tab (= its main frame id). Cached; falls back to t3tab-<id>. */
+  private async resolveTargetId(tabId: number): Promise<string> {
+    const cached = realTargetIds.get(tabId);
+    if (cached) return cached;
+    try {
+      await this.ext("cdp.attach", { tabId });
+      const r = await this.ext<{ frameTree?: { frame?: { id?: string } } }>("cdp.send", { tabId, method: "Page.getFrameTree", params: {} });
+      const id = r?.frameTree?.frame?.id;
+      if (id) {
+        realTargetIds.set(tabId, id);
+        tabsByTargetId.set(id, tabId);
+        return id;
+      }
+    } catch (e) {
+      this.log("cdp relay: could not read target id for tab", tabId, String(e));
+    }
+    return fallbackTargetId(tabId);
   }
 
   private targetInfo(tab: TabInfo) {
@@ -107,10 +145,23 @@ export class CdpRelay {
     };
   }
 
-  private async attachTab(tabId: number): Promise<string> {
+  private attaching = new Map<number, Promise<string>>();
+
+  /** De-duplicated: createTarget and the tab.created event can both ask for the same new tab. */
+  private attachTab(tabId: number): Promise<string> {
     const existing = this.pageSession.get(tabId);
-    if (existing) return existing;
+    if (existing) return Promise.resolve(existing);
+    let pending = this.attaching.get(tabId);
+    if (!pending) {
+      pending = this.doAttachTab(tabId).finally(() => this.attaching.delete(tabId));
+      this.attaching.set(tabId, pending);
+    }
+    return pending;
+  }
+
+  private async doAttachTab(tabId: number): Promise<string> {
     await this.ext("cdp.attach", { tabId });
+    await this.resolveTargetId(tabId);
     const sessionId = `t3s-${tabId}-${++this.seq}`;
     this.sessions.set(sessionId, { tabId });
     this.pageSession.set(tabId, sessionId);
@@ -179,17 +230,19 @@ export class CdpRelay {
       }
       case "Target.setAutoAttach": {
         this.autoAttach = !!p.autoAttach;
-        this.reply(req, {});
+        // Like Chrome: announce existing targets before answering, so clients (Playwright) see them.
         if (this.autoAttach) for (const t of await this.refreshTabs()) await this.attachTab(t.tabId).catch((e) => this.log("auto-attach failed", String(e)));
-        return;
+        return this.reply(req, {});
       }
       case "Target.createTarget": {
         const tab = await this.ext<TabInfo>("tabs.open", { url: p.url || "about:blank", active: p.background === false });
         this.knownTabs.set(tab.tabId, tab);
-        this.reply(req, { targetId: targetIdFor(tab.tabId) });
+        await this.resolveTargetId(tab.tabId);
+        // Like Chrome: targetCreated/attachedToTarget arrive before the createTarget response
+        // (Playwright's newPage() looks the page up as soon as the response lands).
         if (this.discover) this.emit("Target.targetCreated", { targetInfo: this.targetInfo(tab) });
         if (this.autoAttach) await this.attachTab(tab.tabId);
-        return;
+        return this.reply(req, { targetId: targetIdFor(tab.tabId) });
       }
       case "Target.closeTarget": {
         const tabId = tabIdFor(String(p.targetId));
@@ -208,6 +261,25 @@ export class CdpRelay {
         return this.reply(req, { windowId: 1, bounds: { left: 0, top: 0, width: 1280, height: 800, windowState: "normal" } });
       case "Browser.close":
         // Never close the user's own browser on behalf of an automation client.
+        return this.reply(req, {});
+      // Cookies (Playwright's page.request / context.cookies() use these on the browser session).
+      // chrome.debugger has no browser session, so they go through one of this thread's tabs.
+      case "Storage.getCookies": {
+        const tabId = await this.anyTab();
+        if (tabId === undefined) return this.reply(req, { cookies: [] });
+        const r = await this.ext<{ cookies?: unknown[] }>("cdp.send", { tabId, method: "Network.getAllCookies", params: {} })
+          .catch(() => this.ext<{ cookies?: unknown[] }>("cdp.send", { tabId, method: "Storage.getCookies", params: {} }));
+        return this.reply(req, { cookies: r?.cookies ?? [] });
+      }
+      case "Storage.setCookies": {
+        const tabId = await this.anyTab();
+        if (tabId !== undefined && Array.isArray(p.cookies) && p.cookies.length)
+          await this.ext("cdp.send", { tabId, method: "Network.setCookies", params: { cookies: p.cookies } });
+        return this.reply(req, {});
+      }
+      case "Storage.clearCookies":
+        // Never wipe the user's sign-ins on behalf of an automation client.
+        this.log("cdp relay: refused Storage.clearCookies");
         return this.reply(req, {});
       default:
         this.log("cdp relay: no-op browser method", req.method);
@@ -243,6 +315,7 @@ export class CdpRelay {
         this.detachTab(data.tabId, "target_closed");
         this.knownTabs.delete(data.tabId);
         if (this.discover) this.emit("Target.targetDestroyed", { targetId: targetIdFor(data.tabId) });
+        { const id = realTargetIds.get(data.tabId); if (id) tabsByTargetId.delete(id); realTargetIds.delete(data.tabId); }
         return;
       case "cdp.detached":
         this.detachTab(data.tabId, data.reason);

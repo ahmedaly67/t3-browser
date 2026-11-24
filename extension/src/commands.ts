@@ -766,12 +766,35 @@ export const handlers: Record<string, (s: Session, p: Params) => Promise<unknown
     const tab = await prepare(s, tabId);
     let x: number;
     let y: number;
+    let backendNodeId: number | undefined;
     if (p.ref) {
-      ({ x, y } = await clickablePoint(tabId, resolveRef(tabId, p.ref).backendNodeId));
+      backendNodeId = resolveRef(tabId, p.ref).backendNodeId;
+      ({ x, y } = await clickablePoint(tabId, backendNodeId));
     } else if (typeof p.x === "number" && typeof p.y === "number") {
       ({ x, y } = p as { x: number; y: number });
     } else throw new ActionError("Pass a ref from browser_snapshot (or x/y coordinates).");
+    // In a hidden tab Chrome can drop raw mouse input entirely (seen on Windows: the press and
+    // release never reach the page). Watch for the click event; if it never arrives, click the
+    // element through the DOM instead. Visible tabs always get real mouse input only.
+    const plainClick = backendNodeId !== undefined && (p.button ?? "left") === "left" && !p.doubleClick;
+    const hidden = plainClick && !(await pageVisible(tabId));
+    const FLAG = "__t3BrowserClickSeen";
+    if (hidden) {
+      await send(tabId, "Runtime.evaluate", {
+        expression: `window.${FLAG} = false; addEventListener("click", () => { window.${FLAG} = true; }, { capture: true, once: true });`,
+      }).catch(() => {});
+    }
     await mouseClick(tabId, x, y, p.button ?? "left", p.doubleClick ? 2 : 1);
+    if (hidden && !dialogs.has(tabId)) {
+      await sleep(150);
+      const seen = await send<{ result: { value?: boolean } }>(tabId, "Runtime.evaluate", { expression: `window.${FLAG} !== false`, returnByValue: true })
+        .then((r) => r.result.value === true)
+        .catch(() => true); // page already navigated away: the click landed
+      if (!seen) {
+        const objectId = await objectIdFor(tabId, backendNodeId!);
+        await unlessDialog(tabId, callOn(tabId, objectId, "function () { this.click(); }", []));
+      }
+    }
     return afterAction(tabId, tab.url);
   },
 
